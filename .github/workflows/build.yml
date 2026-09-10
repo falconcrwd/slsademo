@@ -1,12 +1,15 @@
 # Build a container image and attach signed SLSA v1 Build L3 provenance
-# using actions/attest@v4 (the current supported path — the older
-# slsa-framework/slsa-github-generator workflow is deprecated).
+# and an SPDX SBOM using actions/attest@v4 (the current supported path — the
+# older slsa-framework/slsa-github-generator workflow is deprecated).
 #
 # One job:
 #   - checkout, buildx, log in to GHCR, build+push (captures the image digest),
 #   - actions/attest@v4 default mode signs a SLSA build-provenance predicate
 #     via Sigstore public-good, uploads the bundle to GitHub's Attestations
-#     API, and pushes it to GHCR next to the image (push-to-registry: true).
+#     API, and pushes it to GHCR next to the image (push-to-registry: true),
+#   - anchore/sbom-action generates an SPDX SBOM of the pushed image,
+#   - actions/attest@v4 (SBOM mode) signs the SBOM as a second attestation
+#     bound to the same image digest.
 #
 # Runs entirely on the GitHub Free tier: public repos get unlimited Linux
 # Actions minutes, free Sigstore public-good signing, and free GHCR hosting.
@@ -74,4 +77,27 @@ jobs:
           # the bytes being attested are identified by the digest instead.
           subject-name: ${{ steps.image.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        # Syft (wrapped by anchore/sbom-action) inspects the pushed image
+        # layer-by-layer and produces an SPDX-JSON document describing every
+        # package, Go module, and file inside it. Pinning to @digest ensures
+        # we scan exactly the bytes we just pushed and just attested.
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false          # we're attesting it, not uploading
+
+      - name: Attest SBOM
+        # Same subject as the provenance attestation, but sbom-path switches
+        # attest@v4 into SBOM mode: the predicate is the SPDX document itself,
+        # signed by Sigstore and pushed to GHCR alongside the provenance one.
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.spdx.json
           push-to-registry: true

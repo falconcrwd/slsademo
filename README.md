@@ -1,9 +1,13 @@
 # SLSA Build L3 Container Demo
 
 A minimal, end-to-end demo that builds a container image on GitHub-hosted
-runners and attaches **SLSA v1 Build Level 3** provenance to it — the highest
-Build level SLSA v1 defines, and the highest achievable on the GitHub Free
-tier.
+runners and attaches **two signed attestations** to it:
+
+1. **SLSA v1 Build Level 3 provenance** — who built it, from what source,
+   with what workflow. Highest Build level SLSA v1 defines, and the highest
+   achievable on the GitHub Free tier.
+2. **An SPDX SBOM** — every package, Go module, and file inside the image,
+   scanned by [Syft](https://github.com/anchore/syft).
 
 Uses [`actions/attest@v4`][attest] (the current, supported provenance action).
 The older `slsa-framework/slsa-github-generator` reusable workflow is
@@ -15,7 +19,7 @@ deprecated in favour of this path.
 |------|---------|
 | `main.go`, `go.mod` | Trivial HTTP "hello" service |
 | `Dockerfile` | Multi-stage, distroless-static image |
-| `.github/workflows/build.yml` | Build → push → attest, all in one job |
+| `.github/workflows/build.yml` | Build → push → attest provenance → SBOM → attest SBOM |
 | `verify.sh` | Consumer-side verification via `gh attestation verify` |
 
 ## Why this is SLSA Build L3 (and not higher)
@@ -35,12 +39,28 @@ There is no defined Build L4 in SLSA v1. Two adjacent tracks are out of scope:
 
 ## How it works
 
-`.github/workflows/build.yml` has one job:
+`.github/workflows/build.yml` has one job with four meaningful steps:
 
-1. Build the image with Buildx and push it to GHCR. The `docker/build-push-action` `digest` output gives the immutable `sha256:…` for the pushed image.
-2. `actions/attest@v4` runs with **no `sbom-path`/`predicate-*` inputs**, which puts it in default *provenance mode*: it constructs a SLSA v1 build-provenance predicate about the built image, signs it with a short-lived Sigstore Fulcio cert whose SAN is the OIDC identity of *this* workflow, and:
-   - uploads the signed bundle to GitHub's Attestations API (indexed on the repo — visible under **Actions → Attestations**), and
-   - pushes it to GHCR next to the image (`push-to-registry: true`), so registry consumers can verify without hitting GitHub.
+1. **Build and push** the image with Buildx. The `docker/build-push-action`
+   `digest` output gives the immutable `sha256:…` for the pushed image; every
+   subsequent step binds to that exact digest, not to a mutable tag.
+2. **Attest build provenance** — `actions/attest@v4` in default mode (no
+   `sbom-path` / `predicate-*` inputs) constructs a SLSA v1 build-provenance
+   predicate about the image, signs it with a short-lived Sigstore Fulcio cert
+   whose SAN is the OIDC identity of *this* workflow, uploads the signed
+   bundle to GitHub's Attestations API, and pushes it to GHCR next to the
+   image (`push-to-registry: true`).
+3. **Generate SBOM** — `anchore/sbom-action` (a wrapper around
+   [Syft](https://github.com/anchore/syft)) scans the pushed image pinned by
+   digest and emits `sbom.spdx.json`, describing every package, Go module, and
+   file inside the image.
+4. **Attest SBOM** — a second `actions/attest@v4` call, this time in *SBOM
+   mode* (triggered by `sbom-path`). Same subject digest as the provenance
+   attestation, but the predicate is the SPDX document. Signed, uploaded,
+   pushed to GHCR the same way.
+
+Both attestations end up bound to the same image digest, so a single
+`gh attestation verify` invocation covers them together.
 
 Permissions the job needs (all standard, no PATs):
 
@@ -76,9 +96,12 @@ A successful run prints something like:
 
 ```
 Loaded digest sha256:… for oci://ghcr.io/<user>/slsademo:latest
-Loaded 1 attestation from GitHub API
+Loaded 2 attestations from GitHub API
 ✓ Verification succeeded!
 ```
+
+The `2 attestations` line is the provenance + SBOM pair — both are verified
+against the same trust policy in one shot.
 
 Under the hood, `gh attestation verify`:
 
@@ -97,11 +120,21 @@ gh attestation verify oci://ghcr.io/<user>/slsademo:latest \
   --signer-workflow <user>/slsademo/.github/workflows/build.yml
 ```
 
-To eyeball the raw attestation without verifying:
+To eyeball the raw attestations without verifying:
 
 ```bash
 gh attestation download oci://ghcr.io/<user>/slsademo:latest --repo <user>/slsademo
-cat attestation.jsonl | jq .
+# writes attestation.jsonl — one JSON line per attestation
+
+# Provenance predicate:
+jq -r 'select(.dsseEnvelope.payloadType=="application/vnd.in-toto+json")
+       | .dsseEnvelope.payload | @base64d | fromjson
+       | select(.predicateType | startswith("https://slsa.dev/"))' attestation.jsonl
+
+# SPDX SBOM predicate:
+jq -r 'select(.dsseEnvelope.payloadType=="application/vnd.in-toto+json")
+       | .dsseEnvelope.payload | @base64d | fromjson
+       | select(.predicateType | startswith("https://spdx.dev/"))' attestation.jsonl
 ```
 
 ## Running the container locally
@@ -116,6 +149,8 @@ curl localhost:8080
 
 - Using artifact attestations — <https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds>
 - `actions/attest` — <https://github.com/actions/attest>
+- `anchore/sbom-action` (Syft) — <https://github.com/anchore/sbom-action>
+- SPDX v2.3 spec — <https://spdx.github.io/spdx-spec/v2.3/>
 - SLSA v1.0 spec — <https://slsa.dev/spec/v1.0/>
 - Build L3 requirements — <https://slsa.dev/spec/v1.0/levels#build-l3>
 
