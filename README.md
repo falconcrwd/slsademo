@@ -59,8 +59,9 @@ There is no defined Build L4 in SLSA v1. Two adjacent tracks are out of scope:
    attestation, but the predicate is the SPDX document. Signed, uploaded,
    pushed to GHCR the same way.
 
-Both attestations end up bound to the same image digest, so a single
-`gh attestation verify` invocation covers them together.
+Both attestations end up bound to the same image digest. `gh attestation
+verify` filters by predicate type on each call (default is SLSA provenance),
+so `verify.sh` runs it twice — once per predicate — to cover both.
 
 Permissions the job needs (all standard, no PATs):
 
@@ -92,16 +93,24 @@ is built in. No extra tools.
 ./verify.sh <your-gh-user>/slsademo latest
 ```
 
-A successful run prints something like:
+A successful run prints two verification blocks — one for the SLSA
+provenance predicate and one for the SPDX SBOM predicate — each ending in
+`✓ Verification succeeded!`.
 
-```
-Loaded digest sha256:… for oci://ghcr.io/<user>/slsademo:latest
-Loaded 2 attestations from GitHub API
-✓ Verification succeeded!
-```
+`gh attestation verify` filters attestations by predicate type per call
+(default is `https://slsa.dev/provenance/v1`), so `verify.sh` calls it once
+per predicate. To confirm both attestations are present without verifying,
+list them:
 
-The `2 attestations` line is the provenance + SBOM pair — both are verified
-against the same trust policy in one shot.
+```bash
+gh attestation download oci://ghcr.io/<user>/slsademo:latest --repo <user>/slsademo
+# Writes to <image-digest>.jsonl in the current directory, e.g.
+#   sha256:92c04c0…f6ac.jsonl
+
+jq -r '.dsseEnvelope.payload | @base64d | fromjson | .predicateType' sha256:*.jsonl
+# https://slsa.dev/provenance/v1
+# https://spdx.dev/Document/v2.3
+```
 
 Under the hood, `gh attestation verify`:
 
@@ -124,17 +133,18 @@ To eyeball the raw attestations without verifying:
 
 ```bash
 gh attestation download oci://ghcr.io/<user>/slsademo:latest --repo <user>/slsademo
-# writes attestation.jsonl — one JSON line per attestation
+# Writes <image-digest>.jsonl (e.g. sha256:92c04c0…f6ac.jsonl) —
+# one JSON line per attestation.
 
 # Provenance predicate:
 jq -r 'select(.dsseEnvelope.payloadType=="application/vnd.in-toto+json")
        | .dsseEnvelope.payload | @base64d | fromjson
-       | select(.predicateType | startswith("https://slsa.dev/"))' attestation.jsonl
+       | select(.predicateType | startswith("https://slsa.dev/"))' sha256:*.jsonl
 
 # SPDX SBOM predicate:
 jq -r 'select(.dsseEnvelope.payloadType=="application/vnd.in-toto+json")
        | .dsseEnvelope.payload | @base64d | fromjson
-       | select(.predicateType | startswith("https://spdx.dev/"))' attestation.jsonl
+       | select(.predicateType | startswith("https://spdx.dev/"))' sha256:*.jsonl
 ```
 
 ## Running the container locally
