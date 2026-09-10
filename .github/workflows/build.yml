@@ -1,0 +1,77 @@
+# Build a container image and attach signed SLSA v1 Build L3 provenance
+# using actions/attest@v4 (the current supported path — the older
+# slsa-framework/slsa-github-generator workflow is deprecated).
+#
+# One job:
+#   - checkout, buildx, log in to GHCR, build+push (captures the image digest),
+#   - actions/attest@v4 default mode signs a SLSA build-provenance predicate
+#     via Sigstore public-good, uploads the bundle to GitHub's Attestations
+#     API, and pushes it to GHCR next to the image (push-to-registry: true).
+#
+# Runs entirely on the GitHub Free tier: public repos get unlimited Linux
+# Actions minutes, free Sigstore public-good signing, and free GHCR hosting.
+
+name: build-and-attest
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write            # push image + attestation to GHCR
+      id-token: write            # mint OIDC token for Sigstore keyless signing
+      attestations: write        # upload attestation bundle to GH API
+      artifact-metadata: write   # create the artifact storage record
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects capitals — normalise the image path once and reuse it.
+      - id: image
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          echo "image=${image,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image }}:${{ github.sha }}
+            ${{ steps.image.outputs.image }}:latest
+          # Buildx's own inline attestations off — attest@v4 produces the
+          # authoritative SLSA provenance in the next step.
+          provenance: false
+          sbom: false
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          # subject-name MUST be the fully-qualified image path WITHOUT a tag;
+          # the bytes being attested are identified by the digest instead.
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
