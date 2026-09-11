@@ -205,7 +205,7 @@ workflow that signs twice ends up with two certs. Same *identity* (the SAN
 wc -l sha256:*.jsonl                              # → 2
 
 # What are the two certificate SANs? Should be identical — same workflow.
-jq -r '.verificationMaterial.certificate.rawBytes' sha256:*.jsonl \
+jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes' sha256:*.jsonl \
   | while read -r cert; do
       echo "$cert" | base64 -d \
         | openssl x509 -inform DER -noout -ext subjectAltName
@@ -261,6 +261,61 @@ Cosign / actions/attest@v4        ← client tool: does the work
    └─► Rekor (Sigstore tlog)      ← "log the signature+cert publicly so
                                      anyone can prove this happened"
 ```
+
+The same relationships, rendered — note that **Fulcio and Rekor sit inside
+Sigstore**, while **in-toto is a separate format** that Cosign happens to
+sign:
+
+```mermaid
+flowchart TB
+    Dev["👤 Developer / CI job"]
+    OIDC["OIDC identity token<br/>(GitHub Actions, Google, …)"]
+
+    subgraph Client["Client tooling"]
+        Cosign["Cosign<br/>(or actions/attest@v4)"]
+    end
+
+    subgraph Format["Attestation format"]
+        InToto["in-toto Statement v1<br/>subject + predicateType + predicate"]
+        DSSE["DSSE envelope<br/>(payload + signatures)"]
+    end
+
+    subgraph Sigstore["Sigstore (umbrella / public-good infra)"]
+        Fulcio["Fulcio<br/>Certificate Authority<br/>(short-lived x.509, ~10 min)"]
+        Rekor["Rekor<br/>Transparency log<br/>(append-only Merkle tree)"]
+    end
+
+    Bundle["Sigstore bundle<br/>(DSSE + cert chain + tlog entry)"]
+    Registry["OCI registry<br/>(bundle attached to image via referrers)"]
+
+    Dev --> Cosign
+    Dev -.-> OIDC
+    Cosign -->|"1 present OIDC token"| Fulcio
+    Fulcio -->|"2 ephemeral cert + key"| Cosign
+    Cosign -->|"3 wrap claim as"| InToto
+    InToto -->|"4 base64 into payload of"| DSSE
+    Cosign -->|"5 sign DSSE payload"| DSSE
+    Cosign -->|"6 upload sig + cert"| Rekor
+    Rekor -->|"7 inclusion proof + signed timestamp"| Cosign
+    DSSE --> Bundle
+    Fulcio -.->|cert chain| Bundle
+    Rekor -.->|tlog entry| Bundle
+    Cosign -->|"8 attach"| Registry
+```
+
+Read it as three layers plus one flow:
+
+- **Client tooling** (Cosign / `actions/attest@v4`) is what a human or CI
+  job actually invokes.
+- **Attestation format** (in-toto statement wrapped in a DSSE envelope) is
+  independent of Sigstore — you could sign the same in-toto statement with
+  a plain long-lived key and no transparency log, and it would still be a
+  valid attestation. Sigstore just makes it *keyless and durable*.
+- **Sigstore** contributes the two services (Fulcio + Rekor) that let step
+  1–2 (get a short-lived cert) and step 6–7 (log it forever) happen.
+- The final **Sigstore bundle** is the single JSON object that packages
+  the signed DSSE, the Fulcio cert, and the Rekor tlog entry so any
+  verifier can check everything offline given only Sigstore's public roots.
 
 ### in-toto — the *format*, not a program
 

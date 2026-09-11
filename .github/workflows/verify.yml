@@ -1,0 +1,124 @@
+# Consumer-side verification of the image produced by build.yml.
+#
+# Pulls the image from GHCR and uses cosign to verify that:
+#   1. the in-toto attestations attached to the image are signed by Sigstore
+#      and chain to the public-good Fulcio root (image bytes untampered),
+#   2. the signing certificate's SAN identifies THIS repo's build.yml workflow
+#      (image came from the trusted publisher), and
+#   3. a SLSA v1 build-provenance predicate is present and bound to the exact
+#      image digest (provenance attestation verified).
+#
+# Uses cosign because the user asked for it; `gh attestation verify` (see
+# verify.sh) does the same job with a different UI. Both consume the same
+# Sigstore bundles that actions/attest@v4 attaches to the image.
+
+name: verify-image
+
+on:
+  # Fire automatically after every successful build-and-attest run.
+  workflow_run:
+    workflows: [build-and-attest]
+    types: [completed]
+  # And allow manual verification against a specific tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to verify (defaults to latest)
+        default: latest
+        required: false
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # OIDC issuer for GitHub-hosted runners — pinned so a compromised issuer
+  # can't slip in an attestation signed by a different identity provider.
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  verify:
+    # Skip the automatic run if the build failed — nothing to verify.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read            # pull image + attestation manifests from GHCR
+
+    steps:
+      # cosign-installer drops the `cosign` binary on PATH. v3.x is current;
+      # if v4.1.0 isn't published yet, bump this down to sigstore/cosign-installer@v3.
+      - uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects capitals in image paths — lowercase the repo path once.
+      - id: image
+        name: Normalise image path
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          echo "image=${image,,}" >> "$GITHUB_OUTPUT"
+
+      # Resolve the tag to an immutable digest FIRST. Everything downstream
+      # verifies against @sha256:… so a racing re-tag can't substitute a
+      # different image between resolve and verify.
+      - id: resolve
+        name: Resolve tag → digest
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" \
+                     --format '{{.Manifest.Digest}}')"
+          echo "Resolved ${IMAGE}:${TAG} → ${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # The certificate-identity regex pins the SAN to build.yml on any ref
+      # in THIS repo. Escape the repo's `/` so it can't be exploited as a
+      # regex metachar, and anchor both ends so a suffix match can't sneak
+      # in a look-alike identity like "…/build.yml.evil".
+      - id: identity
+        name: Compute certificate-identity regex
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          repo_re="${REPO//\//\\/}"
+          echo "regex=^https:\\/\\/github\\.com\\/${repo_re}\\/\\.github\\/workflows\\/build\\.yml@refs\\/.+$" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Verify SLSA build-provenance attestation
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          IDENTITY_RE: ${{ steps.identity.outputs.regex }}
+        run: |
+          # --type slsaprovenance1 is SLSA v1.0 (what actions/attest@v4 emits
+          # by default). --type slsaprovenance is the older v0.2 predicate.
+          cosign verify-attestation \
+            --type slsaprovenance1 \
+            --certificate-identity-regexp "${IDENTITY_RE}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            "${IMAGE}@${DIGEST}" \
+            > /dev/null
+          echo "✓ SLSA build-provenance attestation verified for ${IMAGE}@${DIGEST}"
+
+      # Bonus: the same image carries an SPDX SBOM attestation from build.yml
+      # step 4. Verify it too — same trust chain, different predicate type.
+      - name: Verify SPDX SBOM attestation
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          IDENTITY_RE: ${{ steps.identity.outputs.regex }}
+        run: |
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-identity-regexp "${IDENTITY_RE}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            "${IMAGE}@${DIGEST}" \
+            > /dev/null
+          echo "✓ SPDX SBOM attestation verified for ${IMAGE}@${DIGEST}"

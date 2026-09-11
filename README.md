@@ -20,7 +20,9 @@ deprecated in favour of this path.
 | `main.go`, `go.mod` | Trivial HTTP "hello" service |
 | `Dockerfile` | Multi-stage, distroless-static image |
 | `.github/workflows/build.yml` | Build → push → attest provenance → SBOM → attest SBOM |
-| `verify.sh` | Consumer-side verification via `gh attestation verify` |
+| `.github/workflows/verify.yml` | Consumer-side verification in CI via `cosign verify-attestation` (runs automatically after every successful build) |
+| `verify.sh` | Consumer-side verification locally via `gh attestation verify` |
+| `NOTES.md` | Deep-dive notes on the attestation bundle format and how in-toto / Sigstore / Fulcio / Rekor / Cosign fit together |
 
 ## Why this is SLSA Build L3 (and not higher)
 
@@ -86,6 +88,22 @@ That's it. No secrets to configure; `GITHUB_TOKEN` + OIDC handle everything.
 
 ## Verifying the provenance (consumer side)
 
+There are two verifiers in this repo, doing the same job with different UI:
+
+| Verifier | Tool | Where it runs | When to use |
+|---|---|---|---|
+| `verify.sh` | `gh attestation verify` | Locally on your machine | Ad-hoc: you're inspecting the image on your laptop |
+| `.github/workflows/verify.yml` | `cosign verify-attestation` | GitHub Actions | Automatic: fires after every successful `build-and-attest` run; also manually via *Actions → verify-image → Run workflow* |
+
+Both consume the exact same Sigstore bundles that `actions/attest@v4`
+attached to the image, and both enforce the same properties: signature
+chains to the Sigstore public-good root (image untampered), the Fulcio
+cert's SAN identifies **this repo's `build.yml` workflow** (trusted
+publisher), and the in-toto subject digest equals the image's real digest
+(provenance bound to these exact bytes).
+
+### Locally with `verify.sh`
+
 Install the [GitHub CLI](https://cli.github.com/) — `gh attestation verify`
 is built in. No extra tools.
 
@@ -96,6 +114,24 @@ is built in. No extra tools.
 A successful run prints two verification blocks — one for the SLSA
 provenance predicate and one for the SPDX SBOM predicate — each ending in
 `✓ Verification succeeded!`.
+
+### In CI with the `verify-image` workflow
+
+`.github/workflows/verify.yml` uses `sigstore/cosign-installer` +
+`cosign verify-attestation` and runs automatically on every successful
+build. It:
+
+1. resolves `:latest` (or the tag you dispatch it with) to an immutable
+   `@sha256:…` digest via `docker buildx imagetools inspect` — so a racing
+   re-tag can't substitute a different image between resolve and verify,
+2. runs `cosign verify-attestation --type slsaprovenance1` against that
+   digest, pinning `--certificate-identity-regexp` to `build.yml` in this
+   repo and `--certificate-oidc-issuer` to GitHub Actions,
+3. does the same for the SPDX SBOM with `--type spdxjson`.
+
+The workflow needs no secrets beyond the default `GITHUB_TOKEN` (used only
+to pull from GHCR). To verify a tag other than `latest`, dispatch it from
+the Actions tab and pass the tag as input.
 
 `gh attestation verify` filters attestations by predicate type per call
 (default is `https://slsa.dev/provenance/v1`), so `verify.sh` calls it once
