@@ -115,8 +115,12 @@ jobs:
           DIGEST: ${{ steps.resolve.outputs.digest }}
           IDENTITY_RE: ${{ steps.identity.outputs.regex }}
         run: |
+          # Pass the full predicate URI here (not cosign's `spdxjson`
+          # short alias): `spdxjson` expands to `https://spdx.dev/Document`
+          # unversioned, but actions/attest@v4 emits the versioned
+          # `https://spdx.dev/Document/v2.3`, and cosign matches exactly.
           cosign verify-attestation \
-            --type spdxjson \
+            --type https://spdx.dev/Document/v2.3 \
             --certificate-identity-regexp "${IDENTITY_RE}" \
             --certificate-oidc-issuer "${OIDC_ISSUER}" \
             "${IMAGE}@${DIGEST}" \
