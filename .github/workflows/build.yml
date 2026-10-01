@@ -20,6 +20,15 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Skip rebuilds for changes that can't affect the image bytes — otherwise
+    # committing a new digest into kyverno/examples/workloads.yaml triggers a
+    # build that makes that digest stale again. Path filters don't apply to
+    # tag pushes, so v* releases always build; workflow_dispatch forces one.
+    paths-ignore:
+      - '**.md'
+      - 'kyverno/**'
+      - 'verify.sh'
+      - '.github/workflows/verify.yml'
   workflow_dispatch:
 
 permissions: {}

@@ -28,9 +28,10 @@ spec:
             - containerPort: 8080
           securityContext:
             runAsNonRoot: true
-            # The image sets `USER nonroot:nonroot` (a name). The kubelet can't
-            # resolve names, so runAsNonRoot alone fails with "image has
-            # non-numeric user". 65532 is distroless's nonroot UID/GID.
+            # The Dockerfile already sets a numeric `USER 65532:65532`, which is
+            # all runAsNonRoot needs. Setting it here too keeps the pod non-root
+            # even for older digests built with the name `nonroot:nonroot`
+            # (the kubelet rejects those with "image has non-numeric user").
             runAsUser: 65532
             runAsGroup: 65532
             allowPrivilegeEscalation: false
