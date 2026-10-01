@@ -1,0 +1,94 @@
+# Admission-time equivalent of the "Verify SPDX SBOM attestation" step in
+# .github/workflows/verify.yml, plus a content check the CI verifier doesn't
+# do: because the SBOM is a *signed* statement of what's inside the image,
+# Kyverno can make deploy decisions on it without re-scanning the image.
+#
+# Same trust chain as require-slsa-provenance.yaml (same issuer, same SAN),
+# different predicate type. Kept as a separate policy so it can be rolled out
+# in Audit while provenance is already in Deny, and so a failure tells you
+# exactly which attestation was missing.
+#
+# Requires Kyverno >= 1.19 (ImageValidatingPolicy at policies.kyverno.io/v1).
+
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: require-sbom-attestation
+  annotations:
+    policies.kyverno.io/title: Require signed SPDX SBOM
+    policies.kyverno.io/category: Software Supply Chain Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Admits ghcr.io/falconcrwd/slsademo only if it carries an SPDX 2.3 SBOM
+      attestation signed by this repo's build.yml workflow, and the SBOM does
+      not list any package version on the deny list.
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  webhookConfiguration:
+    timeoutSeconds: 30
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+
+  matchImageReferences:
+    - glob: "ghcr.io/falconcrwd/slsademo"
+    - glob: "ghcr.io/falconcrwd/slsademo:*"
+    - glob: "ghcr.io/falconcrwd/slsademo@*"
+
+  validationConfigurations:
+    mutateDigest: true
+    verifyDigest: true
+    required: true
+
+  attestors:
+    - name: github
+      cosign:
+        keyless:
+          identities:
+            - issuer: https://token.actions.githubusercontent.com
+              subjectRegExp: '^https://github\.com/falconcrwd/slsademo/\.github/workflows/build\.yml@refs/(heads/main|tags/v[^/]+)$'
+        ctlog:
+          url: https://rekor.sigstore.dev
+
+  attestations:
+    - name: sbom
+      intoto:
+        # Versioned URI emitted by actions/attest@v4 in SBOM mode — see the
+        # note in verify.yml on why cosign's `spdxjson` alias doesn't match.
+        type: https://spdx.dev/Document/v2.3
+
+  variables:
+    # Example deny list: "name@version" of packages that must never ship.
+    # The xz-utils backdoor (CVE-2024-3094) is the canonical case. Extend this
+    # list — or move it to a ConfigMap read via resource.Get() — as advisories
+    # land, and every new deploy is re-checked against the signed SBOM.
+    - name: deniedPackages
+      expression: >-
+        ['xz-utils@5.6.0', 'xz-utils@5.6.1', 'liblzma5@5.6.0', 'liblzma5@5.6.1']
+
+  validations:
+    - expression: >-
+        images.all(category, images[category].all(image,
+          verifyAttestationSignatures(image, attestations.sbom, [attestors.github]) > 0))
+      message: >-
+        image has no SPDX SBOM attestation signed by
+        falconcrwd/slsademo/.github/workflows/build.yml (main or v* tag)
+
+    - expression: >-
+        images.all(category, images[category].all(image,
+          cel.bind(sbom, extractPayload(image, attestations.sbom).predicate,
+            sbom.spdxVersion == 'SPDX-2.3' &&
+            has(sbom.packages) && sbom.packages.size() > 0)))
+      message: SBOM attestation is not a non-empty SPDX 2.3 document
+
+    - expression: >-
+        images.all(category, images[category].all(image,
+          extractPayload(image, attestations.sbom).predicate.packages.all(pkg,
+            !has(pkg.versionInfo) ||
+            !((pkg.name + '@' + pkg.versionInfo) in variables.deniedPackages))))
+      message: SBOM lists a package version that is on the deny list

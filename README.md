@@ -22,6 +22,7 @@ deprecated in favour of this path.
 | `.github/workflows/build.yml` | Build → push → attest provenance → SBOM → attest SBOM |
 | `.github/workflows/verify.yml` | Consumer-side verification in CI via `cosign verify-attestation` (runs automatically after every successful build) |
 | `verify.sh` | Consumer-side verification locally via `gh attestation verify` |
+| `kyverno/` | Deploy-time verification: Kyverno `ImageValidatingPolicy` resources that refuse to admit the image into a Kubernetes cluster unless its provenance and SBOM attestations verify (see `kyverno/README.md`) |
 | `NOTES.md` | Deep-dive notes on the attestation bundle format and how in-toto / Sigstore / Fulcio / Rekor / Cosign fit together |
 
 ## Why this is SLSA Build L3 (and not higher)
@@ -94,6 +95,7 @@ There are two verifiers in this repo, doing the same job with different UI:
 |---|---|---|---|
 | `verify.sh` | `gh attestation verify` | Locally on your machine | Ad-hoc: you're inspecting the image on your laptop |
 | `.github/workflows/verify.yml` | `cosign verify-attestation` | GitHub Actions | Automatic: fires after every successful `build-and-attest` run; also manually via *Actions → verify-image → Run workflow* |
+| `kyverno/*.yaml` | Kyverno `ImageValidatingPolicy` | Kubernetes admission | Enforcement: the image can't run in the cluster unless it verifies; also pins it to the verified digest |
 
 Both consume the exact same Sigstore bundles that `actions/attest@v4`
 attached to the image, and both enforce the same properties: signature
