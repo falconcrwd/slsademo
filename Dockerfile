@@ -13,6 +13,8 @@ RUN go build -ldflags="-s -w -buildid=" -o /out/app .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/app /app
-USER nonroot:nonroot
+# Numeric UID:GID (distroless's "nonroot" user) rather than the name, so
+# Kubernetes can prove the container isn't root when runAsNonRoot is set.
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/app"]

@@ -1,0 +1,128 @@
+# Admission-time equivalent of the "Verify SLSA build-provenance attestation"
+# step in .github/workflows/verify.yml. Kyverno intercepts every Pod (and, via
+# autogen, every Deployment / StatefulSet / DaemonSet / Job / CronJob / …) that
+# references the slsademo image and refuses it unless:
+#
+#   1. a Sigstore bundle with an in-toto SLSA v1 provenance predicate is
+#      attached to the image in GHCR, its signature chains to the Sigstore
+#      public-good Fulcio root and is recorded in Rekor (image untampered),
+#   2. the Fulcio cert's SAN is THIS repo's build.yml, on main or a v* tag,
+#      issued by GitHub Actions OIDC (trusted publisher, protected ref),
+#   3. the in-toto subject digest equals the image digest (bound to the exact
+#      bytes), and
+#   4. the provenance predicate itself says the build ran on a GitHub-hosted
+#      runner from this repo's build.yml (the SLSA Build L3 isolation claim).
+#
+# Kyverno also rewrites the image tag to the verified @sha256 digest
+# (mutateDigest) so the kubelet pulls exactly the bytes that were verified —
+# the in-cluster version of verify.yml's "resolve tag → digest" step.
+#
+# Requires Kyverno >= 1.19 (ImageValidatingPolicy at policies.kyverno.io/v1).
+# Kyverno auto-detects the Sigstore bundle (v0.3) format that actions/attest@v4
+# pushes to GHCR, including GHCR's referrers-tag fallback (sha256-<digest>).
+
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: require-slsa-provenance
+  annotations:
+    policies.kyverno.io/title: Require SLSA v1 build provenance
+    policies.kyverno.io/category: Software Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Admits ghcr.io/falconcrwd/slsademo only if it carries a SLSA v1
+      provenance attestation signed by this repo's build.yml workflow via
+      GitHub Actions OIDC + Sigstore public-good, built on a GitHub-hosted
+      runner. Pins the admitted image to its verified digest.
+spec:
+  # Deny (not Audit) — an unverified image never reaches the kubelet. Switch
+  # to [Audit] first if you want to observe policy reports before enforcing.
+  validationActions: [Deny]
+  # If Kyverno can't complete verification (registry / TUF / Rekor
+  # unreachable), fail closed rather than silently admitting.
+  failurePolicy: Fail
+  webhookConfiguration:
+    # Signature verification makes network calls to GHCR and Sigstore TUF;
+    # the default 10s can be tight on a cold cache.
+    timeoutSeconds: 30
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+
+  # Only images from this repo are subject to the policy. Globs match the
+  # literal string in the pod spec, so cover bare, tagged and digest forms —
+  # but NOT "slsademo*", which would also match e.g. "slsademo-evil".
+  matchImageReferences:
+    - glob: "ghcr.io/falconcrwd/slsademo"
+    - glob: "ghcr.io/falconcrwd/slsademo:*"
+    - glob: "ghcr.io/falconcrwd/slsademo@*"
+
+  validationConfigurations:
+    mutateDigest: true   # rewrite :tag → @sha256:… after verification
+    verifyDigest: true   # and require every matched image to be digest-pinned
+    required: true       # every matched image must be verified by some policy
+
+  attestors:
+    - name: github
+      cosign:
+        keyless:
+          identities:
+            # Same trust anchor as verify.yml's --certificate-oidc-issuer /
+            # --certificate-identity-regexp, but tightened to the two refs
+            # build.yml actually publishes from (push to main, v* tags). A
+            # workflow_dispatch run on a feature branch produces a validly
+            # signed image that this policy will still reject.
+            - issuer: https://token.actions.githubusercontent.com
+              subjectRegExp: '^https://github\.com/falconcrwd/slsademo/\.github/workflows/build\.yml@refs/(heads/main|tags/v[^/]+)$'
+        ctlog:
+          url: https://rekor.sigstore.dev
+
+  attestations:
+    - name: slsa
+      intoto:
+        # Full URI, matched exactly against the statement's predicateType —
+        # same value verify.sh passes to --predicate-type.
+        type: https://slsa.dev/provenance/v1
+
+  validations:
+    # `images` is a map of category (containers, initContainers,
+    # ephemeralContainers) → matched image refs; iterate all of them so an
+    # init container can't be used to sneak an image past the policy.
+    - expression: >-
+        images.all(category, images[category].all(image,
+          verifyAttestationSignatures(image, attestations.slsa, [attestors.github]) > 0))
+      message: >-
+        image has no SLSA v1 provenance attestation signed by
+        falconcrwd/slsademo/.github/workflows/build.yml (main or v* tag)
+
+    # The signature proves WHO signed; the predicate says HOW it was built.
+    # extractPayload returns the verified in-toto statement, so the claim
+    # lives under .predicate. Only callable after verifyAttestationSignatures.
+    - expression: >-
+        images.all(category, images[category].all(image,
+          cel.bind(p, extractPayload(image, attestations.slsa).predicate,
+            p.buildDefinition.buildType == 'https://actions.github.io/buildtypes/workflow/v1' &&
+            p.buildDefinition.externalParameters.workflow.repository == 'https://github.com/falconcrwd/slsademo' &&
+            p.buildDefinition.externalParameters.workflow.path == '.github/workflows/build.yml' &&
+            p.buildDefinition.internalParameters.github.runner_environment == 'github-hosted')))
+      message: >-
+        SLSA provenance does not describe a GitHub-hosted build of
+        falconcrwd/slsademo/.github/workflows/build.yml
+
+    # Repo and owner names can be deleted and re-registered by someone else;
+    # the numeric IDs can't. Pinning them defeats a repo-resurrection attack
+    # where an attacker recreates "falconcrwd/slsademo" and signs their own
+    # image with an identical-looking SAN. Values come from the provenance of
+    # an existing build (`gh attestation download … | jq …internalParameters`).
+    - expression: >-
+        images.all(category, images[category].all(image,
+          cel.bind(gh, extractPayload(image, attestations.slsa).predicate.buildDefinition.internalParameters.github,
+            gh.repository_id == '1363639888' &&
+            gh.repository_owner_id == '264948564')))
+      message: >-
+        SLSA provenance repository_id / repository_owner_id do not match the
+        trusted falconcrwd/slsademo repository

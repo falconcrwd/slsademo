@@ -1,0 +1,49 @@
+# Sample workloads for exercising the policies, against a real cluster with
+# `kubectl apply` or offline with `kyverno apply --resource` (see
+# kyverno/README.md).
+---
+# PASS: built + attested by build.yml on main. Pinned by digest (note the `@`,
+# not `:`), so mutateDigest leaves it untouched and verification runs against
+# exactly these bytes. Update the digest after each build, or use `:latest` and
+# let Kyverno's mutating webhook pin it (in-cluster only — the CLI skips that
+# step). Do NOT use the `:sha256-<digest>` tag: that's the attestation index
+# actions/attest@v4 pushes, not the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slsademo
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: slsademo}
+  template:
+    metadata:
+      labels: {app: slsademo}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/falconcrwd/slsademo@sha256:6b14c5e992c40ba4adbb1a3328dac3340d01061f384ed845d9c96c6ee5d12d42
+          ports:
+            - containerPort: 8080
+          securityContext:
+            runAsNonRoot: true
+            # The image sets `USER nonroot:nonroot` (a name). The kubelet can't
+            # resolve names, so runAsNonRoot alone fails with "image has
+            # non-numeric user". 65532 is distroless's nonroot UID/GID.
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+---
+# PASS (not matched): images outside ghcr.io/falconcrwd/slsademo are ignored
+# by these policies — guard them with a separate registry-allowlist policy.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unrelated-image
+  namespace: default
+spec:
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
