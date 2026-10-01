@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: ghcr.io/falconcrwd/slsademo@sha256:6b14c5e992c40ba4adbb1a3328dac3340d01061f384ed845d9c96c6ee5d12d42
+          image: ghcr.io/falconcrwd/slsademo@sha256:b944cb41403a212797dfc047683e5699fd0d0740138e33c1653cb36cdc9ccbe2
           ports:
             - containerPort: 8080
           securityContext:
